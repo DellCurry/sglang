@@ -533,7 +533,7 @@ class ShardedStateLoader(BaseModelLoader):
                 same_storage_groups[tensor.device, ptr].append((key, tensor))
 
         def get_end_ptr(tensor: torch.Tensor) -> int:
-            return tensor.view(-1)[-1].data_ptr() + tensor.element_size()
+            return tensor.contiguous().view(-1)[-1].data_ptr() + tensor.element_size()
 
         result: Dict[str, torch.Tensor] = {}
         for group in same_storage_groups.values():
@@ -659,7 +659,7 @@ class ShardedStateLoader(BaseModelLoader):
                 part_idx += 1
                 total_size = 0
                 state_dict_part = {}
-            state_dict_part[key] = tensor
+            state_dict_part[key] = tensor.contiguous()
             total_size += param_size
         if len(state_dict_part) > 0:
             filename = pattern.format(rank=rank, part=part_idx)
@@ -1253,7 +1253,7 @@ class RemoteModelLoader(BaseModelLoader):
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
-                client.set(r_key, tensor)
+                client.set(r_key, tensor.contiguous())
 
             for root, _, files in os.walk(model_path):
                 for file_name in files:

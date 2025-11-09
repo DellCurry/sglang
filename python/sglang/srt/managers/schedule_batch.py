@@ -41,7 +41,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union, Dict
 
 import numpy as np
 import torch
@@ -426,7 +426,8 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
-        session_cache_offset: Optional[int] = None,
+        old_kv_cache: Optional[List[Dict]] = None,
+        new_kv_cache: Optional[List[Dict]] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
@@ -455,7 +456,8 @@ class Req:
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
-        self.session_cache_offset = session_cache_offset
+        self.old_kv_cache = old_kv_cache
+        self.new_kv_cache = new_kv_cache
         self.input_embeds = input_embeds
 
         # for corss-endoder model

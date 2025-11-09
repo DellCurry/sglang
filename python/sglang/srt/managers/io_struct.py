@@ -69,6 +69,12 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
+    # The session cache segments.
+    # Each segment is a dict with 'token_start', 'token_length'
+    # and 'uri' keys.
+    old_kv_cache: Optional[List[Dict]] = None
+    new_kv_cache: Optional[List[Dict]] = None
+
 
 
 # Type definitions for multimodal input data

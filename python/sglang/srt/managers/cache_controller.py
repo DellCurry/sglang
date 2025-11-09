@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Dict
 
 import torch
 
@@ -214,13 +214,25 @@ class SessionOperation:
         self,
         session_id: str,
         host_indices: torch.Tensor,
+        token_ids: List[int],
         starting_offset: int,
         prefetch_length: int,
+        last_hash: str,
+        old_kv_cache: Optional[List[Dict]] = None,
+        new_kv_cache: Optional[List[Dict]] = None,
     ):
+        assert len(host_indices) == len(token_ids), (
+            f"host_indices and token_ids should have the same length, "
+            f"but got {len(host_indices)} and {len(token_ids)}"
+        )
         self.session_id = session_id
         self.host_indices = host_indices
+        self.token_ids = token_ids
         self.starting_offset = starting_offset
         self.prefetch_length = prefetch_length
+        self.old_kv_cache = old_kv_cache
+        self.new_kv_cache = new_kv_cache
+        self.last_hash = last_hash
         self.done = False
 
 
@@ -390,6 +402,7 @@ class HiCacheController:
 
             self.prefetch_queue = Queue()
             self.backup_queue = Queue()
+            self.host_mem_release_queue = Queue()
 
             self.prefetch_thread.start()
             self.backup_thread.start()
@@ -398,43 +411,59 @@ class HiCacheController:
         self,
         session_id: str,
         host_indices: torch.Tensor,
+        token_ids: List[int],
         starting_offset: int,
         prefetch_length: int,
+        last_hash: str,
+        old_kv_cache: Optional[List[Dict]],
     ):
+        print(f"prefetch_from_session_cache {session_id} {host_indices} {starting_offset} {prefetch_length} {old_kv_cache}")
         operation = SessionOperation(
-            session_id, host_indices, starting_offset, prefetch_length
+            session_id, host_indices, token_ids, starting_offset, prefetch_length, last_hash, old_kv_cache
         )
         self.prefetch_queue.put(operation)
         return operation
 
     def append_session_cache(
-        self, session_id: str, starting_offset: int, data: torch.Tensor, event
+        self, session_id: str, starting_offset: int, 
+        data: torch.Tensor, event, 
+        new_kv_cache: Optional[List[Dict]] = None,
     ):
-        self.backup_queue.put((session_id, starting_offset, data, event))
+        self.backup_queue.put((session_id, starting_offset, new_kv_cache, data, event))
 
     def naive_slicing(
         self, session_id: str, starting_offset: int, prefetch_length: int
     ):
-        file_path = f"/tmp/{session_id}"
-        tensor = torch.load(file_path, map_location="cpu")
+        file_path = f"/tmp/session_{session_id}"
+        try:
+            tensor = torch.load(file_path, map_location="cpu")
+        except FileNotFoundError:
+            return None
+
+        # todo: more layout and more attn support
+        # current layer first mha, [2, layer_num, seq_len, head_num, head_size]
+        # maybe abstract to higher
         end_offset = starting_offset + prefetch_length
-        if end_offset > tensor.numel():
+        if end_offset - 1 > tensor.shape[2]:
             raise ValueError(
                 f"Requested range [{starting_offset}, {end_offset}) "
-                f"exceeds tensor size {tensor.numel()}"
+                f"exceeds tensor size {tensor.shape[2]}"
             )
-        data_slice = tensor[starting_offset:end_offset]
+        data_slice = tensor[:, :, starting_offset:end_offset, :, :]
+        print(f"naive_slicing {session_id} {starting_offset} {prefetch_length} {data_slice.shape}")
         return data_slice
 
     def naive_appending(
-        self, session_id: str, starting_offset: int, data: torch.Tensor
+        self, session_id: str, new_kv_cache, starting_offset: int, data: torch.Tensor
     ):
-        file_path = f"/tmp/{session_id}"
+        print(f"naive_appending {session_id} {starting_offset} {data.shape}")
+        file_path = f"/tmp/session_{session_id}"
         try:
             existing_tensor = torch.load(file_path, map_location="cpu")
-            if starting_offset < existing_tensor.numel():
-                data = data[existing_tensor.numel() - starting_offset :]
-            new_tensor = torch.cat((existing_tensor, data), dim=0)
+            # todo: more layout and more attn support
+            # current layer first mha, [2, layer_num, seq_len, head_num, head_size]
+            # maybe abstract to higher
+            new_tensor = torch.cat((existing_tensor, data), dim=2)
         except FileNotFoundError:
             new_tensor = data
         torch.save(new_tensor, file_path)
@@ -447,6 +476,12 @@ class HiCacheController:
                 flat_data = self.naive_slicing(
                     op.session_id, op.starting_offset, op.prefetch_length
                 )
+                if flat_data is None:
+                    print("naive_slicing failed")
+                    self.append_host_mem_release(op.host_indices)
+                    op.done = True
+                    continue
+
                 self.mem_pool_host.set_from_flat_data(op.host_indices, flat_data)
                 op.done = True
             except Empty:
@@ -455,12 +490,15 @@ class HiCacheController:
     def backup_session_cache_func(self):
         while not self.stop_event.is_set():
             try:
-                session_id, starting_offset, flat_data, event = self.backup_queue.get(
+                session_id, starting_offset, new_kv_cache, flat_data, event = self.backup_queue.get(
                     block=True, timeout=1
                 )
                 torch.cuda.current_stream().wait_event(event)
                 # todo: demo purpose only. to be replaced with performant access
-                self.naive_appending(session_id, starting_offset, flat_data)
+                #
+                # starting offset means tokens already cached in the session.
+                # flat_data already trimed from starting_offset
+                self.naive_appending(session_id, new_kv_cache, starting_offset, flat_data)
             except Empty:
                 continue
 

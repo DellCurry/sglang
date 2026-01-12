@@ -596,6 +596,12 @@ class HiRadixCache(RadixCache):
                     )
                     hash_value.append(last_hash)
 
+                if self.tp_world_size > 1:
+                    # Temporarily wait for all TP ranks to finish prefetch.
+                    # It is risky if something went wrong with a certain TP,
+                    # try a graceful way in the future.
+                    torch.distributed.barrier(group=self.tp_group)
+
                 need_free = self._insert_helper_host(
                     last_host_node,
                     RadixKey(
@@ -642,7 +648,11 @@ class HiRadixCache(RadixCache):
         self.cache_controller.append_session_cache(session_id, fresh_kv_cache)
         self.ongoing_session_append[session_id] = (last_node, fresh_kv_cache)
 
-        return fresh_kv_cache
+        # Wait for all TP ranks to deliver backup task.
+        torch.distributed.barrier(group=self.tp_group)
+        return fresh_kv_cache.with_adjusted_kv_length(
+            self.cache_controller.storage_config
+        )
 
     def drain_storage_control_queues(self):
         """

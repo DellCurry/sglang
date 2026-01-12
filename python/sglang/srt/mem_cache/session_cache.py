@@ -308,6 +308,34 @@ class SessionCache:
             backup_done=self._backup_done,
         )
 
+    def with_adjusted_kv_length(
+        self, storage_config: HiCacheStorageConfig
+    ) -> "SessionCache":
+        """
+        Returns a new SessionCache with adjusted kv_length for each segment.
+
+        Args:
+            kv_length_per_token: The kv_length to set for each segment.
+        """
+        new_segments = [
+            SessionCacheSegment(
+                token_start=seg.token_start,
+                token_length=seg.token_length,
+                kv_uri=seg.kv_uri,
+                kv_start=seg.kv_start,
+                kv_length=seg.kv_length * storage_config.tp_size,
+            )
+            for seg in self._segments
+        ]
+
+        return SessionCache._from_validated_segments_and_state(
+            segments=tuple(new_segments),
+            offset=self._offset,
+            token_ids=self._token_ids,
+            mem_indices=self._mem_indices,
+            backup_done=self._backup_done,
+        )
+
     def truncate_prefix(self, offset: int) -> "SessionCache":
         """
         Returns a new SessionCache truncated from the beginning up to 'offset'.
@@ -504,7 +532,8 @@ class SessionCache:
                 seg.kv_uri, storage_config, mem_pool_host
             )
 
-            storage.load(filepath, seg.kv_start, flat_data)
+            tp_kv_start = self._cal_tp_kv_start(seg.kv_start, flat_data, storage_config)
+            storage.load(filepath, tp_kv_start, flat_data)
 
             mem_pool_host.set_from_flat_data(mem_indices, flat_data)
 
@@ -540,13 +569,20 @@ class SessionCache:
                 seg.kv_uri, storage_config, mem_pool_host
             )
 
-            storage.save(filepath, seg.kv_start, seg_data)
+            tp_kv_start = self._cal_tp_kv_start(seg.kv_start, seg_data, storage_config)
+            storage.save(filepath, tp_kv_start, seg_data)
 
         self._backup_done = True
 
     def backup_done(self) -> bool:
         """Returns whether this instance has successfully backed up its data."""
         return self._backup_done
+
+    def _cal_tp_kv_start(
+        self, kv_start: int, data: torch.Tensor, storage_config: HiCacheStorageConfig
+    ):
+        expected = data.numel() * data.element_size()
+        return kv_start + storage_config.tp_rank * expected
 
 
 class SessionCacheStorageManager:
